@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -57,7 +58,12 @@ class SparseMLAIndexGroup:
 
     def set_logical_topk_ready(self, layer_index: int) -> None:
         if layer_index == 0 and self.has_indexer:
-            self.logical_topk_ready.record(current_stream())
+            self._record_logical_topk_ready()
+
+    @eager_break_during_capture
+    def _record_logical_topk_ready(self) -> None:
+        # Eager attention must not wait on an event stranded in a graph segment.
+        self.logical_topk_ready.record(current_stream())
 
     def prepare_for_batch(self, layer_index: int, attn_metadata: Any | None) -> None:
         pass

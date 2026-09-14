@@ -13,6 +13,89 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from tests.utils import create_new_process_for_each_test
+
+
+@pytest.mark.parametrize("mode", ["eager", "full", "piecewise"])
+@create_new_process_for_each_test("spawn")
+def test_sparse_mla_index_event_across_attention_break(mode):
+    """An eager index consumer must see fresh indices on every graph replay."""
+    from types import SimpleNamespace
+
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.v1.attention.backends.mla.index_group import (
+        SparseMLAIndexGroupBuilder,
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    inputs = torch.full((2, 128), -1, dtype=torch.int32, device="cuda")
+    seed = torch.tensor([[0, 2, 5], [1, 3, 7]], device="cuda")
+    inputs[:, :3] = seed
+    logical = inputs.clone()
+    output = torch.empty_like(logical)
+    counts_output = torch.empty(2, dtype=torch.int32, device="cuda")
+    builder = SparseMLAIndexGroupBuilder(logical)
+    group, leader = builder.register_layer(True)
+    _, follower = builder.register_layer(False)
+    metadata = SimpleNamespace(
+        block_table=torch.tensor([[2, 3], [4, 5]], dtype=torch.int32, device="cuda"),
+        block_size=4,
+        req_id_per_token=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+    )
+
+    def consume():
+        for layer in (leader, follower):
+            indices, counts = group.convert_logical_to_physical_topk(
+                layer,
+                logical,
+                metadata,
+                block_stride_rows=None,
+                return_valid_counts=True,
+            )
+        return indices, counts
+
+    def forward(capture=None):
+        logical.copy_(inputs)
+        group.set_logical_topk_ready(leader)
+        group.set_logical_topk_ready(follower)
+        indices, counts = consume() if capture is None else capture.add_eager(consume)
+        output.copy_(indices)
+        counts_output.copy_(counts)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        forward()
+        stream.synchronize()
+        if mode == "piecewise":
+            graph = BreakableCUDAGraphCapture()
+            with graph:
+                forward(graph)
+            # Only the producer records an event; follower layers share it.
+            assert graph.num_eager_breaks == 2
+        elif mode == "full":
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                forward()
+
+        for offset in range(3):
+            inputs[:, :3] = (seed + offset) % 8
+            if mode == "eager":
+                forward()
+            else:
+                graph.replay()
+            expected = (
+                metadata.block_table.gather(1, inputs.clamp_min(0).long() // 4) * 4
+                + inputs % 4
+            )
+            expected.masked_fill_(inputs < 0, -1)
+            torch.testing.assert_close(
+                output.sort(dim=1).values, expected.sort(dim=1).values, rtol=0, atol=0
+            )
+            assert counts_output.tolist() == [3, 3]
+
 
 @pytest.fixture(autouse=True)
 def _enable_breakable_cudagraph(monkeypatch: pytest.MonkeyPatch):
@@ -43,6 +126,7 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
     manager._capture_descs = {CUDAGraphMode.PIECEWISE: [desc]}
     manager._graphs_captured = False
     manager.use_breakable_cg = True
+    manager.ubatch_runner = None
 
     create_calls = []
     forward_calls = []
